@@ -162,15 +162,16 @@ jobs:
           import kotlin.math.hypot
 
           /**
-           * Overlay manual: kalibrasi 2 titik lubang meja, tandai bola putih dan bola target.
-           * Aplikasi hanya menghitung garis bantu (bola bayangan) dari titik yang ditandai manual.
-           * Tidak membaca layar dan tidak mengendalikan game.
+           * Overlay manual: kalibrasi 2 titik lubang meja, tandai bola putih, bola target,
+           * dan (opsional) bola penghalang. Hanya menghitung garis bantu dari titik yang
+           * ditandai manual. Tidak membaca layar dan tidak mengendalikan game.
            */
           class AimOverlayView(context: Context) : View(context) {
               private class Pt(val x: Float, val y: Float)
 
               private val calib = mutableListOf<Pt>()
-              private val shot = mutableListOf<Pt>()
+              private val shot = mutableListOf<Pt>() // [0] putih, [1] target, [2..] penghalang
+              private var pending: Pt? = null
 
               var locked = false
                   set(v) { field = v; invalidate() }
@@ -209,50 +210,71 @@ jobs:
               private fun pocketName(i: Int): String =
                   listOf("kiri atas", "tengah atas", "kanan atas", "kiri bawah", "tengah bawah", "kanan bawah")[i]
 
+              private fun distToSeg(px: Float, py: Float, ax: Float, ay: Float, bx: Float, by: Float): Float {
+                  val vx = bx - ax
+                  val vy = by - ay
+                  val l2 = vx * vx + vy * vy
+                  if (l2 < 0.000001f) return hypot(px - ax, py - ay)
+                  val t = (((px - ax) * vx + (py - ay) * vy) / l2).coerceIn(0f, 1f)
+                  return hypot(px - (ax + t * vx), py - (ay + t * vy))
+              }
+
+              private fun blocked(pts: List<Pt>, ax: Float, ay: Float, bx: Float, by: Float, r: Float): Boolean {
+                  for (i in 2 until pts.size) {
+                      if (distToSeg(pts[i].x, pts[i].y, ax, ay, bx, by) < 1.9f * r) return true
+                  }
+                  return false
+              }
+
               override fun onDraw(canvas: Canvas) {
                   super.onDraw(canvas)
                   if (visibility != VISIBLE) return
 
+                  val pd = pending
+                  val pts: List<Pt> = if (pd != null && calib.size == 2 && shot.size < 10) shot + pd else shot
+
                   if (!locked) {
                       canvas.drawRoundRect(dp(12f), dp(36f), width - dp(12f), dp(106f), dp(12f), dp(12f), panel)
                       val instruction = when {
-                          calib.size == 0 -> "Kalibrasi 1/2  Ketuk tengah lubang KIRI ATAS meja"
-                          calib.size == 1 -> "Kalibrasi 2/2  Ketuk tengah lubang KANAN BAWAH meja"
+                          calib.size == 0 -> "Kalibrasi 1/2  Ketuk lubang KIRI ATAS (kursor di atas jari)"
+                          calib.size == 1 -> "Kalibrasi 2/2  Ketuk lubang KANAN BAWAH"
                           shot.size == 0 -> "1/2  Ketuk bola putih"
                           shot.size == 1 -> "2/2  Ketuk bola yang mau dimasukkan"
-                          else -> "Selesai  Tekan KUNCI lalu tembak"
+                          else -> "Ketuk bola penghalang (opsional), lalu KUNCI"
                       }
                       canvas.drawText(instruction, dp(24f), dp(64f), text)
                       text.textSize = dp(11f)
                       canvas.drawText("Mode manual - hanya garis bantu, tidak mengendalikan game", dp(24f), dp(87f), text)
                       text.textSize = dp(14f)
 
+                      ring.color = Color.CYAN
                       if (calib.size == 2) {
-                          ring.color = Color.CYAN
                           for (p in pockets()) canvas.drawCircle(p.x, p.y, dp(10f), ring)
                       } else {
-                          for (p in calib) {
-                              ring.color = Color.CYAN
-                              canvas.drawCircle(p.x, p.y, dp(10f), ring)
-                          }
+                          for (p in calib) canvas.drawCircle(p.x, p.y, dp(10f), ring)
                       }
                   }
 
-                  if (calib.size == 2 && shot.size >= 1) {
-                      drawPoint(canvas, shot[0], Color.WHITE, "CUE")
+                  if (calib.size == 2 && pts.size >= 1) {
+                      drawPoint(canvas, pts[0], Color.WHITE, "CUE")
                   }
-                  if (calib.size == 2 && shot.size >= 2) {
-                      val c = shot[0]
-                      val t = shot[1]
+                  if (calib.size == 2 && pts.size >= 2) {
+                      val c = pts[0]
+                      val t = pts[1]
                       drawPoint(canvas, t, Color.YELLOW, "TARGET")
                       val ps = pockets()
                       val w = ps[2].x - ps[0].x
                       val r = w * 0.0148f
+                      for (i in 2 until pts.size) {
+                          ring.color = Color.RED
+                          canvas.drawCircle(pts[i].x, pts[i].y, r, ring)
+                      }
                       var best = -1
                       var bestScore = Float.MAX_VALUE
                       var bestCut = 0f
                       var bgx = 0f
                       var bgy = 0f
+                      var blockedCount = 0
                       for (i in ps.indices) {
                           val p = ps[i]
                           val tx = p.x - t.x
@@ -270,6 +292,10 @@ jobs:
                           val cosA = ((cx / cl) * dx + (cy / cl) * dy).coerceIn(-1f, 1f)
                           val cut = Math.toDegrees(acos(cosA.toDouble())).toFloat()
                           if (cut > 75f) continue
+                          if (blocked(pts, c.x, c.y, gx, gy, r) || blocked(pts, t.x, t.y, p.x, p.y, r)) {
+                              blockedCount++
+                              continue
+                          }
                           val score = cut + 25f * (cl + tl) / w
                           if (score < bestScore) {
                               bestScore = score
@@ -288,16 +314,31 @@ jobs:
                           drawPoint(canvas, p, Color.GREEN, "LUBANG")
                           val info = "Saran: lubang %s, sudut potong %.0f°".format(pocketName(best), bestCut)
                           canvas.drawText(info, dp(24f), height - dp(30f), text)
+                      } else if (blockedCount > 0) {
+                          canvas.drawText("Semua jalur terhalang bola yang kamu tandai", dp(24f), height - dp(30f), text)
                       } else {
                           canvas.drawText("Tidak ada jalur lurus yang masuk akal", dp(24f), height - dp(30f), text)
                       }
                   }
+
+                  if (pd != null && !locked) drawCursor(canvas, pd)
 
                   if (locked) return
                   canvas.drawRoundRect(width - dp(104f), dp(44f), width - dp(22f), dp(92f), dp(9f), dp(9f), panel)
                   canvas.drawText("RESET", width - dp(88f), dp(74f), text)
                   canvas.drawRoundRect(width - dp(214f), dp(44f), width - dp(112f), dp(92f), dp(9f), dp(9f), panel)
                   canvas.drawText("KALIB", width - dp(198f), dp(74f), text)
+                  canvas.drawRoundRect(width - dp(324f), dp(44f), width - dp(222f), dp(92f), dp(9f), dp(9f), panel)
+                  canvas.drawText("UNDO", width - dp(306f), dp(74f), text)
+              }
+
+              private fun drawCursor(c: Canvas, p: Pt) {
+                  ring.color = Color.MAGENTA
+                  c.drawCircle(p.x, p.y, dp(12f), ring)
+                  line.color = Color.MAGENTA
+                  line.pathEffect = null
+                  c.drawLine(p.x - dp(22f), p.y, p.x + dp(22f), p.y, line)
+                  c.drawLine(p.x, p.y - dp(22f), p.x, p.y + dp(22f), line)
               }
 
               private fun drawPoint(c: Canvas, p: Pt, color: Int, label: String) {
@@ -315,24 +356,46 @@ jobs:
                   line.pathEffect = null
               }
 
+              private fun addPoint(p: Pt) {
+                  if (calib.size < 2) {
+                      calib.add(p)
+                  } else if (shot.size < 10) {
+                      shot.add(p)
+                  }
+              }
+
               override fun onTouchEvent(event: MotionEvent): Boolean {
-                  if (event.action == MotionEvent.ACTION_UP) {
-                      val x = event.x
-                      val y = event.y
-                      if (y < dp(112f) && x > width - dp(222f)) {
-                          if (x > width - dp(112f)) {
-                              shot.clear()
-                          } else {
-                              calib.clear()
-                              shot.clear()
-                          }
-                      } else if (calib.size < 2) {
-                          calib.add(Pt(x, y))
-                      } else {
-                          if (shot.size >= 2) shot.clear()
-                          shot.add(Pt(x, y))
+                  val x = event.x
+                  val y = event.y
+                  val inButtons = y < dp(112f) && x > width - dp(330f)
+                  when (event.action) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                          pending = if (inButtons) null else Pt(x, maxOf(0f, y - dp(56f)))
+                          invalidate()
                       }
-                      invalidate()
+                      MotionEvent.ACTION_UP -> {
+                          val p = pending
+                          pending = null
+                          if (inButtons) {
+                              if (x > width - dp(112f)) {
+                                  shot.clear()
+                              } else if (x > width - dp(222f)) {
+                                  calib.clear()
+                                  shot.clear()
+                              } else if (shot.isNotEmpty()) {
+                                  shot.removeAt(shot.size - 1)
+                              } else if (calib.isNotEmpty()) {
+                                  calib.removeAt(calib.size - 1)
+                              }
+                          } else if (p != null) {
+                              addPoint(p)
+                          }
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_CANCEL -> {
+                          pending = null
+                          invalidate()
+                      }
                   }
                   return true
               }
@@ -340,6 +403,7 @@ jobs:
               fun resetIfClosed(closed: Boolean) {
                   if (closed) {
                       shot.clear()
+                      pending = null
                       invalidate()
                   }
               }
