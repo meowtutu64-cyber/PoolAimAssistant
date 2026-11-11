@@ -319,10 +319,10 @@ jobs:
                   if (event.action == MotionEvent.ACTION_UP) {
                       val x = event.x
                       val y = event.y
-                      if (y < dp(112f)) {
+                      if (y < dp(112f) && x > width - dp(222f)) {
                           if (x > width - dp(112f)) {
                               shot.clear()
-                          } else if (x > width - dp(222f)) {
+                          } else {
                               calib.clear()
                               shot.clear()
                           }
