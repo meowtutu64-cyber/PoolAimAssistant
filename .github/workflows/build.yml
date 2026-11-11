@@ -27,16 +27,326 @@ jobs:
       - name: Fix project
         run: |
           cd source/PoolAimAssistant
-          sed -i 's/catch (_: Exception)/catch (e: Exception)/g' app/src/main/java/com/example/poolaimassistant/AimOverlayService.kt
           sed -i 's/compileSdk = 35/compileSdk = 35\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n    kotlinOptions { jvmTarget = "17" }/' app/build.gradle.kts
-          cat app/build.gradle.kts
 
-      - name: Fix overlay order and add long-press stop
+      - name: Write overlay service
         run: |
           cd source/PoolAimAssistant
-          F=app/src/main/java/com/example/poolaimassistant/AimOverlayService.kt
-          sed -i -e 's/^        showBubble()$/        __TMP__/' -e 's/^        showAimLayer()$/        showBubble()/' -e 's/^        __TMP__$/        showAimLayer()/' -e 's/setOnClickListener { toggleAim() }/setOnClickListener { toggleAim() }\n            setOnLongClickListener { stopSelf(); true }/' $F
-          sed -n 20,40p $F
+          cat > app/src/main/java/com/example/poolaimassistant/AimOverlayService.kt <<'EOF'
+          package com.example.poolaimassistant
+
+          import android.app.Service
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.TextView
+
+          class AimOverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private var bubble: TextView? = null
+              private var aimView: AimOverlayView? = null
+              private var aimParams: WindowManager.LayoutParams? = null
+              private var mode = 0 // 0 = tutup, 1 = tandai, 2 = kunci
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  showAimLayer()
+                  showBubble()
+                  applyMode()
+              }
+
+              private fun overlayType(): Int =
+                  WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+              private fun showAimLayer() {
+                  val v = AimOverlayView(this)
+                  val p = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      alpha = 0.8f
+                  }
+                  aimView = v
+                  aimParams = p
+                  wm.addView(v, p)
+              }
+
+              private fun showBubble() {
+                  val b = TextView(this).apply {
+                      text = "AIM"
+                      textSize = 12f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.rgb(18, 125, 90))
+                      setOnClickListener {
+                          mode = (mode + 1) % 3
+                          applyMode()
+                      }
+                      setOnLongClickListener {
+                          stopSelf()
+                          true
+                      }
+                  }
+                  val p = WindowManager.LayoutParams(
+                      dp(56), dp(56), overlayType(),
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.END
+                      x = dp(18); y = dp(180)
+                  }
+                  bubble = b
+                  wm.addView(b, p)
+              }
+
+              private fun applyMode() {
+                  val v = aimView ?: return
+                  val p = aimParams ?: return
+                  var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  if (mode != 1) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  p.flags = flags
+                  v.visibility = if (mode == 0) View.GONE else View.VISIBLE
+                  v.locked = (mode == 2)
+                  if (mode == 0) v.resetIfClosed(true)
+                  wm.updateViewLayout(v, p)
+                  bubble?.text = when (mode) {
+                      1 -> "KUNCI"
+                      2 -> "TUTUP"
+                      else -> "AIM"
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onDestroy() {
+                  bubble?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  aimView?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                  bubble = null
+                  aimView = null
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Write overlay view
+        run: |
+          cd source/PoolAimAssistant
+          cat > app/src/main/java/com/example/poolaimassistant/AimOverlayView.kt <<'EOF'
+          package com.example.poolaimassistant
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.graphics.Typeface
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.acos
+          import kotlin.math.hypot
+
+          /**
+           * Overlay manual: kalibrasi 2 titik lubang meja, tandai bola putih dan bola target.
+           * Aplikasi hanya menghitung garis bantu (bola bayangan) dari titik yang ditandai manual.
+           * Tidak membaca layar dan tidak mengendalikan game.
+           */
+          class AimOverlayView(context: Context) : View(context) {
+              private class Pt(val x: Float, val y: Float)
+
+              private val calib = mutableListOf<Pt>()
+              private val shot = mutableListOf<Pt>()
+
+              var locked = false
+                  set(v) { field = v; invalidate() }
+
+              private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = dp(2.2f)
+                  strokeCap = Paint.Cap.ROUND
+              }
+              private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = dp(2f)
+              }
+              private val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  textSize = dp(14f)
+                  typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+              }
+              private val panel = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = 0xCC101820.toInt()
+                  style = Paint.Style.FILL
+              }
+
+              private fun pockets(): List<Pt> {
+                  val a = calib[0]
+                  val b = calib[1]
+                  val x1 = minOf(a.x, b.x)
+                  val x2 = maxOf(a.x, b.x)
+                  val y1 = minOf(a.y, b.y)
+                  val y2 = maxOf(a.y, b.y)
+                  val mx = (x1 + x2) / 2f
+                  return listOf(Pt(x1, y1), Pt(mx, y1), Pt(x2, y1), Pt(x1, y2), Pt(mx, y2), Pt(x2, y2))
+              }
+
+              private fun pocketName(i: Int): String =
+                  listOf("kiri atas", "tengah atas", "kanan atas", "kiri bawah", "tengah bawah", "kanan bawah")[i]
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  if (visibility != VISIBLE) return
+
+                  if (!locked) {
+                      canvas.drawRoundRect(dp(12f), dp(36f), width - dp(12f), dp(106f), dp(12f), dp(12f), panel)
+                      val instruction = when {
+                          calib.size == 0 -> "Kalibrasi 1/2  Ketuk tengah lubang KIRI ATAS meja"
+                          calib.size == 1 -> "Kalibrasi 2/2  Ketuk tengah lubang KANAN BAWAH meja"
+                          shot.size == 0 -> "1/2  Ketuk bola putih"
+                          shot.size == 1 -> "2/2  Ketuk bola yang mau dimasukkan"
+                          else -> "Selesai  Tekan KUNCI lalu tembak"
+                      }
+                      canvas.drawText(instruction, dp(24f), dp(64f), text)
+                      text.textSize = dp(11f)
+                      canvas.drawText("Mode manual - hanya garis bantu, tidak mengendalikan game", dp(24f), dp(87f), text)
+                      text.textSize = dp(14f)
+
+                      if (calib.size == 2) {
+                          ring.color = Color.CYAN
+                          for (p in pockets()) canvas.drawCircle(p.x, p.y, dp(10f), ring)
+                      } else {
+                          for (p in calib) {
+                              ring.color = Color.CYAN
+                              canvas.drawCircle(p.x, p.y, dp(10f), ring)
+                          }
+                      }
+                  }
+
+                  if (calib.size == 2 && shot.size >= 1) {
+                      drawPoint(canvas, shot[0], Color.WHITE, "CUE")
+                  }
+                  if (calib.size == 2 && shot.size >= 2) {
+                      val c = shot[0]
+                      val t = shot[1]
+                      drawPoint(canvas, t, Color.YELLOW, "TARGET")
+                      val ps = pockets()
+                      val w = ps[2].x - ps[0].x
+                      val r = w * 0.0148f
+                      var best = -1
+                      var bestScore = Float.MAX_VALUE
+                      var bestCut = 0f
+                      var bgx = 0f
+                      var bgy = 0f
+                      for (i in ps.indices) {
+                          val p = ps[i]
+                          val tx = p.x - t.x
+                          val ty = p.y - t.y
+                          val tl = hypot(tx, ty)
+                          if (tl < 1f) continue
+                          val dx = tx / tl
+                          val dy = ty / tl
+                          val gx = t.x - dx * 2f * r
+                          val gy = t.y - dy * 2f * r
+                          val cx = gx - c.x
+                          val cy = gy - c.y
+                          val cl = hypot(cx, cy)
+                          if (cl < 1f) continue
+                          val cosA = ((cx / cl) * dx + (cy / cl) * dy).coerceIn(-1f, 1f)
+                          val cut = Math.toDegrees(acos(cosA.toDouble())).toFloat()
+                          if (cut > 75f) continue
+                          val score = cut + 25f * (cl + tl) / w
+                          if (score < bestScore) {
+                              bestScore = score
+                              best = i
+                              bestCut = cut
+                              bgx = gx
+                              bgy = gy
+                          }
+                      }
+                      if (best >= 0) {
+                          val p = ps[best]
+                          drawLine(canvas, c, Pt(bgx, bgy), Color.WHITE)
+                          ring.color = Color.WHITE
+                          canvas.drawCircle(bgx, bgy, r, ring)
+                          drawLine(canvas, t, p, Color.YELLOW)
+                          drawPoint(canvas, p, Color.GREEN, "LUBANG")
+                          val info = "Saran: lubang %s, sudut potong %.0f°".format(pocketName(best), bestCut)
+                          canvas.drawText(info, dp(24f), height - dp(30f), text)
+                      } else {
+                          canvas.drawText("Tidak ada jalur lurus yang masuk akal", dp(24f), height - dp(30f), text)
+                      }
+                  }
+
+                  if (locked) return
+                  canvas.drawRoundRect(width - dp(104f), dp(44f), width - dp(22f), dp(92f), dp(9f), dp(9f), panel)
+                  canvas.drawText("RESET", width - dp(88f), dp(74f), text)
+                  canvas.drawRoundRect(width - dp(214f), dp(44f), width - dp(112f), dp(92f), dp(9f), dp(9f), panel)
+                  canvas.drawText("KALIB", width - dp(198f), dp(74f), text)
+              }
+
+              private fun drawPoint(c: Canvas, p: Pt, color: Int, label: String) {
+                  dot.color = color
+                  c.drawCircle(p.x, p.y, dp(7f), dot)
+                  text.color = color
+                  c.drawText(label, p.x + dp(10f), p.y - dp(10f), text)
+                  text.color = Color.WHITE
+              }
+
+              private fun drawLine(c: Canvas, a: Pt, b: Pt, color: Int) {
+                  line.color = color
+                  line.pathEffect = DashPathEffect(floatArrayOf(dp(9f), dp(7f)), 0f)
+                  c.drawLine(a.x, a.y, b.x, b.y, line)
+                  line.pathEffect = null
+              }
+
+              override fun onTouchEvent(event: MotionEvent): Boolean {
+                  if (event.action == MotionEvent.ACTION_UP) {
+                      val x = event.x
+                      val y = event.y
+                      if (y < dp(112f)) {
+                          if (x > width - dp(112f)) {
+                              shot.clear()
+                          } else if (x > width - dp(222f)) {
+                              calib.clear()
+                              shot.clear()
+                          }
+                      } else if (calib.size < 2) {
+                          calib.add(Pt(x, y))
+                      } else {
+                          if (shot.size >= 2) shot.clear()
+                          shot.add(Pt(x, y))
+                      }
+                      invalidate()
+                  }
+                  return true
+              }
+
+              fun resetIfClosed(closed: Boolean) {
+                  if (closed) {
+                      shot.clear()
+                      invalidate()
+                  }
+              }
+
+              private fun dp(v: Float): Float = v * resources.displayMetrics.density
+          }
+          EOF
 
       - name: Build APK
         run: |
