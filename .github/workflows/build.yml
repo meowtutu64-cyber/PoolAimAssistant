@@ -31,6 +31,13 @@ jobs:
           sed -i 's/compileSdk = 35/compileSdk = 35\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n    kotlinOptions { jvmTarget = "17" }/' app/build.gradle.kts
           cat app/build.gradle.kts
 
+      - name: Fix overlay order and add long-press stop
+        run: |
+          cd source/PoolAimAssistant
+          F=app/src/main/java/com/example/poolaimassistant/AimOverlayService.kt
+          sed -i -e 's/^        showBubble()$/        __TMP__/' -e 's/^        showAimLayer()$/        showBubble()/' -e 's/^        __TMP__$/        showAimLayer()/' -e 's/setOnClickListener { toggleAim() }/setOnClickListener { toggleAim() }\n            setOnLongClickListener { stopSelf(); true }/' $F
+          sed -n 20,40p $F
+
       - name: Build APK
         run: |
           cd source/PoolAimAssistant
