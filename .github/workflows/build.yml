@@ -7,28 +7,36 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: '8.9'
 
       - name: Extract project
-        run: unzip PoolAimAssistant-AndroidStudio.zip -d source
+        run: |
+          mkdir -p source
+          unzip -o PoolAimAssistant-AndroidStudio.zip -d source
+
+      - name: Fix project
+        run: |
+          cd source/PoolAimAssistant
+          sed -i 's/catch (_: Exception)/catch (e: Exception)/g' app/src/main/java/com/example/poolaimassistant/AimOverlayService.kt
+          sed -i 's/compileSdk = 35/compileSdk = 35\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n    kotlinOptions { jvmTarget = "17" }/' app/build.gradle.kts
+          cat app/build.gradle.kts
 
       - name: Build APK
         run: |
           cd source/PoolAimAssistant
-          gradle assembleDebug
+          gradle assembleDebug --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
-          name: PoolAimAssistant-APK
+          name: app-debug
           path: source/PoolAimAssistant/app/build/outputs/apk/debug/app-debug.apk
